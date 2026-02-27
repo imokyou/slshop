@@ -64,6 +64,7 @@ func (e *RateLimitError) Error() string {
 }
 
 // parseResponseError creates a ResponseError from an HTTP response.
+// This is a convenience wrapper that reads the body first.
 func parseResponseError(resp *http.Response) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -72,7 +73,12 @@ func parseResponseError(resp *http.Response) error {
 			Message: "failed to read error response body",
 		}
 	}
+	return parseResponseErrorFromBytes(resp, body)
+}
 
+// parseResponseErrorFromBytes creates a ResponseError from an HTTP response
+// and pre-read body bytes. This avoids double-reading the response body.
+func parseResponseErrorFromBytes(resp *http.Response, body []byte) error {
 	respErr := &ResponseError{
 		Status:  resp.StatusCode,
 		RawBody: body,
@@ -107,7 +113,7 @@ func parseResponseError(resp *http.Response) error {
 			ResponseError: *respErr,
 		}
 		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-			if d, err := time.ParseDuration(retryAfter + "s"); err == nil {
+			if d := parseRetryAfter(retryAfter); d > 0 {
 				rlErr.RetryAfter = d
 			}
 		}

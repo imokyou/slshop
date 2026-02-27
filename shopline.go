@@ -49,8 +49,9 @@ type App struct {
 // Client is the Shopline Admin API client.
 type Client struct {
 	app             App
-	handle          string // Store handle (e.g. "open001" from open001.myshopline.com)
-	token           string // Bearer access token
+	handle          string        // Store handle (e.g. "open001" from open001.myshopline.com)
+	token           string        // Bearer access token (static, used when tokenManager is nil)
+	tokenManager    *TokenManager // automatic token management (overrides token field)
 	apiVersion      string
 	httpClient      *http.Client
 	baseURL         *url.URL
@@ -155,6 +156,11 @@ func NewClient(app App, handle, token string, opts ...Option) (*Client, error) {
 		apiVersion: DefaultAPIVersion,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 		baseURL:    baseURL,
 		maxRetries: 0,
@@ -247,6 +253,17 @@ func (c *Client) GetAPIVersion() string {
 // GetBaseURL returns the base URL.
 func (c *Client) GetBaseURL() *url.URL {
 	return c.baseURL
+}
+
+// TokenManager returns the TokenManager if one was configured via WithTokenManager.
+// Returns nil if no TokenManager is set (i.e., static token mode).
+//
+// Use this to seed an initial token after OAuth, or to invalidate a token:
+//
+//	client.TokenManager().SetInitialToken(ctx, accessToken, expireAt, scope)
+//	client.TokenManager().InvalidateToken(ctx)
+func (c *Client) TokenManager() *TokenManager {
+	return c.tokenManager
 }
 
 // logDebugf logs a debug message if a logger is set.

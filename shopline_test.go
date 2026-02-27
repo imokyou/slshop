@@ -2,10 +2,15 @@ package shopline
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +185,158 @@ func TestDo_RateLimitRetry(t *testing.T) {
 		t.Errorf("expected 2 attempts, got %d", attempt)
 	}
 }
+
+// ============== NEW ROBUST TESTS ==============
+
+func TestDo_RetryPreservesBody(t *testing.T) {
+	attempt := 0
+	client, server := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		body, _ := io.ReadAll(r.Body)
+
+		// Both attempts MUST have the full body
+		if string(body) != `{"title":"test"}` {
+			t.Errorf("attempt %d: expected body `{\"title\":\"test\"}`, got %q", attempt, string(body))
+		}
+
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":1}`))
+	})
+	defer server.Close()
+
+	client.maxRetries = 1
+
+	bodyPayload := map[string]string{"title": "test"}
+	req, _ := client.NewRequest(context.Background(), http.MethodPost, "/test", bodyPayload)
+	var result map[string]int
+	_, err := client.Do(req, &result)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempt != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempt)
+	}
+}
+
+func TestDo_ContextCancellation(t *testing.T) {
+	attempt := 0
+	client, server := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		w.Header().Set("Retry-After", "5") // Wait 5 seconds
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	defer server.Close()
+
+	client.maxRetries = 3
+
+	// Context that cancels almost immediately
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	req, _ := client.NewRequest(ctx, http.MethodGet, "/test", nil)
+	_, err := client.Do(req, nil)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error due to context cancellation")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Errorf("expected context cancelled error, got: %v", err)
+	}
+	// Should return quickly, not wait 5 seconds
+	if duration > 1*time.Second {
+		t.Errorf("expected quick return on context cancel, took %v", duration)
+	}
+	if attempt != 1 {
+		t.Errorf("expected only 1 attempt before cancel, got %d", attempt)
+	}
+}
+
+func TestDo_ExponentialBackoff(t *testing.T) {
+	b0 := backoffDuration(0, time.Second)
+	b1 := backoffDuration(1, time.Second)
+	b2 := backoffDuration(2, time.Second)
+
+	// Due to jitter, we can't assert exact values, but we can assert ranges
+	// Base values are: 1s, 2s, 4s. Jitter is roughly +/- 25%
+	assertRange := func(d time.Duration, ex time.Duration, name string) {
+		min := ex - (ex / 4)
+		max := ex + (ex / 4)
+		if d < min || d > max {
+			t.Errorf("%s: expected between %s and %s, got %s", name, min, max, d)
+		}
+	}
+
+	assertRange(b0, 1*time.Second, "b0")
+	assertRange(b1, 2*time.Second, "b1")
+	assertRange(b2, 4*time.Second, "b2")
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name     string
+		header   string
+		expected time.Duration
+	}{
+		{"Empty", "", 0},
+		{"Seconds int", "120", 120 * time.Second},
+		{"Seconds float", "2.5", 2500 * time.Millisecond},
+		{"Invalid", "abc", 0},
+		{"HTTP Date Future", time.Now().UTC().Add(5 * time.Minute).Truncate(time.Second).Format(http.TimeFormat), 5 * time.Minute},
+		{"HTTP Date Past", time.Now().UTC().Add(-5 * time.Minute).Format(http.TimeFormat), 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRetryAfter(tt.header)
+			// For relative time (HTTP Date), allow small precision delta
+			diff := got - tt.expected
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > time.Second {
+				t.Errorf("expected ~%v, got %v", tt.expected, got)
+			}
+		})
+	}
+}
+
+func TestDo_ResponseBodySizeLimit(t *testing.T) {
+	client, server := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Write exactly maxResponseBodySize + 10 bytes
+		data := make([]byte, maxResponseBodySize+10)
+		for i := range data {
+			data[i] = 'a'
+		}
+		w.Write(data)
+	})
+	defer server.Close()
+
+	req, _ := client.NewRequest(context.Background(), http.MethodGet, "/test", nil)
+	resp, err := client.Do(req, nil)
+	if err != nil && !strings.Contains(err.Error(), "failed to decode") {
+		// We expect json decode error because 'aaa...' is bad json,
+		// but we should NOT get a read timeout or OOM.
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp != nil {
+		// Response body should be closed by Do
+		_, err := io.ReadAll(resp.Body)
+		if err == nil {
+			t.Error("expected error reading from closed body")
+		}
+	}
+}
+
+// ==============================================
 
 func TestAuthSignature(t *testing.T) {
 	app := App{
@@ -504,4 +661,68 @@ func TestStoreGetShop(t *testing.T) {
 	if shop.Name != "My Test Shop" {
 		t.Errorf("expected 'My Test Shop', got %q", shop.Name)
 	}
+}
+
+// ============== auth.go tests ==============
+
+func TestVerifyWebhookRequest_BodyPreserved(t *testing.T) {
+	app := App{
+		AppKey:    "test-key",
+		AppSecret: "test-secret",
+	}
+
+	originalBody := `{"topic":"orders/create","id":123}`
+
+	// Compute valid HMAC
+	mac := hmacSHA256([]byte(app.AppSecret), []byte(originalBody))
+
+	req := &http.Request{
+		Header: http.Header{
+			"X-Shopline-Hmac-Sha256": {mac},
+		},
+		Body: io.NopCloser(strings.NewReader(originalBody)),
+	}
+
+	valid := app.VerifyWebhookRequest(req)
+	if !valid {
+		t.Fatal("expected webhook signature to be valid")
+	}
+
+	// KEY: Body must still be readable after verification
+	bodyAfter, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read body after verify: %v", err)
+	}
+	if string(bodyAfter) != originalBody {
+		t.Errorf("body not preserved: got %q, want %q", string(bodyAfter), originalBody)
+	}
+}
+
+func TestGetAccessToken_EmptyHandle(t *testing.T) {
+	app := App{AppKey: "k", AppSecret: "s"}
+	_, err := app.GetAccessToken(context.Background(), "", "code123")
+	if err == nil {
+		t.Fatal("expected error for empty handle")
+	}
+	if !strings.Contains(err.Error(), "handle must not be empty") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRefreshAccessToken_EmptyHandle(t *testing.T) {
+	app := App{AppKey: "k", AppSecret: "s"}
+	_, err := app.RefreshAccessToken(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty handle")
+	}
+	if !strings.Contains(err.Error(), "handle must not be empty") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// hmacSHA256 computes HMAC-SHA256 for test use.
+func hmacSHA256(key, data []byte) string {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
 }

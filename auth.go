@@ -1,6 +1,7 @@
 package shopline
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -12,7 +13,21 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 )
+
+// authHTTPClient is a dedicated HTTP client for auth endpoints with
+// proper timeout and connection pool settings. Using http.DefaultClient
+// in production is dangerous — it has no timeout, so a single slow
+// response can block a goroutine forever.
+var authHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // TokenResponse represents the response from token creation/refresh API.
 type TokenResponse struct {
@@ -104,52 +119,11 @@ func (app App) VerifySignature(query url.Values) bool {
 // This corresponds to Step 4 of the Shopline OAuth flow.
 // POST https://{handle}.myshopline.com/admin/oauth/token/create
 func (app App) GetAccessToken(ctx context.Context, handle, code string) (*TokenResponse, error) {
-	timestamp := fmt.Sprintf("%d", currentTimeMillis())
-	signParams := map[string]string{
-		"appkey":    app.AppKey,
-		"timestamp": timestamp,
-	}
-	sign := app.GenerateSignature(signParams)
-
-	apiURL := fmt.Sprintf("https://%s.myshopline.com/admin/oauth/token/create", handle)
-
-	body := map[string]string{"code": code}
-	bodyJSON, err := json.Marshal(body)
+	bodyJSON, err := json.Marshal(map[string]string{"code": code})
 	if err != nil {
 		return nil, fmt.Errorf("shopline: failed to marshal body: %w", err)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(string(bodyJSON)))
-	if err != nil {
-		return nil, fmt.Errorf("shopline: failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("appkey", app.AppKey)
-	req.Header.Set("timestamp", timestamp)
-	req.Header.Set("sign", sign)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("shopline: token request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("shopline: failed to read token response: %w", err)
-	}
-
-	var tokenResp TokenResponse
-	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
-		return nil, fmt.Errorf("shopline: failed to parse token response: %w", err)
-	}
-
-	if tokenResp.Code != 200 {
-		return &tokenResp, fmt.Errorf("shopline: token request failed: %s (code: %d)", tokenResp.Message, tokenResp.Code)
-	}
-
-	return &tokenResp, nil
+	return app.doAuthRequest(ctx, handle, "create", bytes.NewReader(bodyJSON))
 }
 
 // RefreshAccessToken refreshes the access token before it expires (10-hour validity).
@@ -157,16 +131,27 @@ func (app App) GetAccessToken(ctx context.Context, handle, code string) (*TokenR
 // This corresponds to Step 6 of the Shopline OAuth flow.
 // POST https://{handle}.myshopline.com/admin/oauth/token/refresh
 func (app App) RefreshAccessToken(ctx context.Context, handle string) (*TokenResponse, error) {
+	return app.doAuthRequest(ctx, handle, "refresh", nil)
+}
+
+// doAuthRequest is the shared implementation for token create/refresh requests.
+// It handles signature generation, header setting, request execution, and
+// response parsing in a single place to eliminate code duplication.
+func (app App) doAuthRequest(ctx context.Context, handle, endpoint string, body io.Reader) (*TokenResponse, error) {
+	// P1-5: Validate handle to prevent empty or malicious URL construction
+	if handle == "" {
+		return nil, fmt.Errorf("shopline: handle must not be empty")
+	}
+
 	timestamp := fmt.Sprintf("%d", currentTimeMillis())
-	signParams := map[string]string{
+	sign := app.GenerateSignature(map[string]string{
 		"appkey":    app.AppKey,
 		"timestamp": timestamp,
-	}
-	sign := app.GenerateSignature(signParams)
+	})
 
-	apiURL := fmt.Sprintf("https://%s.myshopline.com/admin/oauth/token/refresh", handle)
+	apiURL := fmt.Sprintf("https://%s.myshopline.com/admin/oauth/token/%s", handle, endpoint)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("shopline: failed to create request: %w", err)
 	}
@@ -176,24 +161,27 @@ func (app App) RefreshAccessToken(ctx context.Context, handle string) (*TokenRes
 	req.Header.Set("timestamp", timestamp)
 	req.Header.Set("sign", sign)
 
-	resp, err := http.DefaultClient.Do(req)
+	// P0-1: Use dedicated client with timeout instead of http.DefaultClient
+	resp, err := authHTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("shopline: refresh token request failed: %w", err)
+		return nil, fmt.Errorf("shopline: %s token request failed: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// P1-3: Limit response body size to prevent OOM
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
 	if err != nil {
-		return nil, fmt.Errorf("shopline: failed to read refresh response: %w", err)
+		return nil, fmt.Errorf("shopline: failed to read %s response: %w", endpoint, err)
 	}
 
 	var tokenResp TokenResponse
 	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
-		return nil, fmt.Errorf("shopline: failed to parse refresh response: %w", err)
+		return nil, fmt.Errorf("shopline: failed to parse %s response: %w (body: %s)", endpoint, err, string(respBody))
 	}
 
 	if tokenResp.Code != 200 {
-		return &tokenResp, fmt.Errorf("shopline: refresh token failed: %s (code: %d)", tokenResp.Message, tokenResp.Code)
+		return &tokenResp, fmt.Errorf("shopline: %s token request failed: %s (code: %d, traceId: %s)",
+			endpoint, tokenResp.Message, tokenResp.Code, tokenResp.TraceID)
 	}
 
 	return &tokenResp, nil
@@ -203,16 +191,22 @@ func (app App) RefreshAccessToken(ctx context.Context, handle string) (*TokenRes
 //
 // Shopline sends a signature in the X-Shopline-Hmac-SHA256 header.
 // The signature is computed over the raw request body using AppSecret.
+//
+// After verification, the request body is restored so downstream handlers
+// can still read it.
 func (app App) VerifyWebhookRequest(r *http.Request) bool {
 	signature := r.Header.Get("X-Shopline-Hmac-SHA256")
 	if signature == "" {
 		return false
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxResponseBodySize))
 	if err != nil {
 		return false
 	}
+	// P0-2: Restore the body so downstream handlers can read it.
+	// Without this, any handler after verification gets an empty body.
+	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	mac := hmac.New(sha256.New, []byte(app.AppSecret))
 	mac.Write(body)
