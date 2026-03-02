@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -947,5 +948,42 @@ func TestWithCircuitBreaker(t *testing.T) {
 	}
 	if client.cb.State() != "closed" {
 		t.Errorf("expected initial state 'closed', got %q", client.cb.State())
+	}
+}
+
+// ============== 服务注册完整性验证 ==============
+
+// TestNewClient_AllServicesRegistered verifies that every interface-typed field
+// in Client is non-nil after NewClient. This catches the "forgot to register
+// a service" bug at test time rather than waiting for a runtime nil-pointer panic.
+//
+// If you add a new Service field to Client but forget the initialization line
+// in NewClient, this test will immediately report:
+//
+//	client.YourNewService is nil: did you forget to register it in NewClient?
+func TestNewClient_AllServicesRegistered(t *testing.T) {
+	app := App{AppKey: "k", AppSecret: "s"}
+	client, err := NewClient(app, "testshop", "test-token")
+	if err != nil {
+		t.Fatalf("NewClient unexpected error: %v", err)
+	}
+
+	v := reflect.ValueOf(client).Elem()
+	typ := v.Type()
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		fieldType := typ.Field(i)
+
+		// Only check exported interface-typed fields (= Service definitions).
+		if !fieldType.IsExported() {
+			continue
+		}
+		if field.Kind() != reflect.Interface {
+			continue
+		}
+		if field.IsNil() {
+			t.Errorf("client.%s is nil: did you forget to register it in NewClient?", fieldType.Name)
+		}
 	}
 }
