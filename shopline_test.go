@@ -726,3 +726,226 @@ func hmacSHA256(key, data []byte) string {
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// ============== Circuit Breaker Tests ==============
+
+func TestCircuitBreaker_ClosedToOpen(t *testing.T) {
+	cb := newCircuitBreaker(3, 30*time.Second)
+
+	// Should be open after threshold failures
+	for i := 0; i < 3; i++ {
+		if err := cb.Allow(); err != nil {
+			t.Fatalf("unexpected error in closed state: %v", err)
+		}
+		cb.RecordFailure()
+	}
+
+	if cb.State() != "open" {
+		t.Errorf("expected open state, got %q", cb.State())
+	}
+
+	// Requests should be rejected when open
+	if err := cb.Allow(); err == nil {
+		t.Error("expected error when circuit is open")
+	}
+}
+
+func TestCircuitBreaker_OpenToHalfOpenToClosed(t *testing.T) {
+	cb := newCircuitBreaker(1, 10*time.Millisecond)
+
+	// Trip the circuit
+	cb.Allow()
+	cb.RecordFailure()
+	if cb.State() != "open" {
+		t.Fatalf("expected open, got %s", cb.State())
+	}
+
+	// Wait for cooldown
+	time.Sleep(20 * time.Millisecond)
+
+	// Should allow probe request
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("expected allow after cooldown: %v", err)
+	}
+	if cb.State() != "half-open" {
+		t.Errorf("expected half-open after cooldown, got %s", cb.State())
+	}
+
+	// Successful probe closes the circuit
+	cb.RecordSuccess()
+	if cb.State() != "closed" {
+		t.Errorf("expected closed after success, got %s", cb.State())
+	}
+}
+
+func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
+	cb := newCircuitBreaker(1, 10*time.Millisecond)
+
+	cb.Allow()
+	cb.RecordFailure()
+	time.Sleep(20 * time.Millisecond)
+
+	// Probe
+	cb.Allow()
+	if cb.State() != "half-open" {
+		t.Fatalf("expected half-open, got %s", cb.State())
+	}
+
+	// Failed probe re-opens
+	cb.RecordFailure()
+	if cb.State() != "open" {
+		t.Errorf("expected open after probe failure, got %s", cb.State())
+	}
+}
+
+func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
+	cb := newCircuitBreaker(3, 30*time.Second)
+
+	// Record 2 failures (below threshold)
+	cb.Allow()
+	cb.RecordFailure()
+	cb.Allow()
+	cb.RecordFailure()
+
+	// One success resets the counter
+	cb.Allow()
+	cb.RecordSuccess()
+
+	// Now 2 more failures should NOT open (counter reset)
+	cb.Allow()
+	cb.RecordFailure()
+	cb.Allow()
+	cb.RecordFailure()
+
+	if cb.State() != "closed" {
+		t.Errorf("expected closed after reset, got %s", cb.State())
+	}
+}
+
+func TestCircuitBreaker_IntegrationWithClient(t *testing.T) {
+	attempt := 0
+	client, server := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		// Use 503 — the circuit breaker is triggered on 429 and 503
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	defer server.Close()
+
+	client.cb = newCircuitBreaker(2, 30*time.Second)
+	client.maxRetries = 0 // no retries so each request = one failure count
+
+	ctx := context.Background()
+
+	// First two requests trip the circuit (each 503 is one failure)
+	for i := 0; i < 2; i++ {
+		req, _ := client.NewRequest(ctx, http.MethodGet, "/test", nil)
+		client.Do(req, nil) //nolint — intentionally ignoring error
+	}
+
+	if client.cb.State() != "open" {
+		t.Fatalf("expected circuit to be open after failures, got %s", client.cb.State())
+	}
+
+	// Third request should be rejected immediately (no HTTP call)
+	req, _ := client.NewRequest(ctx, http.MethodGet, "/test", nil)
+	_, err := client.Do(req, nil)
+	if err == nil {
+		t.Error("expected error from open circuit")
+	}
+	if attempt > 2 {
+		t.Errorf("expected no additional HTTP calls when circuit open, got %d total", attempt)
+	}
+}
+
+// ============== buildQueryString Slice Tests ==============
+
+func TestBuildQueryString_SliceString(t *testing.T) {
+	opts := struct {
+		Tags []string `url:"tags,omitempty"`
+	}{
+		Tags: []string{"new", "featured", "sale"},
+	}
+	qs := buildQueryString(&opts)
+	// Should contain all three values as repeated params
+	for _, tag := range []string{"new", "featured", "sale"} {
+		if !strings.Contains(qs, "tags="+tag) {
+			t.Errorf("expected 'tags=%s' in query string %q", tag, qs)
+		}
+	}
+}
+
+func TestBuildQueryString_SliceInt64(t *testing.T) {
+	opts := struct {
+		IDs []int64 `url:"ids,omitempty"`
+	}{
+		IDs: []int64{1001, 1002, 1003},
+	}
+	qs := buildQueryString(&opts)
+	for _, id := range []string{"1001", "1002", "1003"} {
+		if !strings.Contains(qs, "ids="+id) {
+			t.Errorf("expected 'ids=%s' in query string %q", id, qs)
+		}
+	}
+}
+
+func TestBuildQueryString_EmptySliceOmitted(t *testing.T) {
+	opts := struct {
+		IDs []int64 `url:"ids,omitempty"`
+	}{
+		IDs: []int64{},
+	}
+	qs := buildQueryString(&opts)
+	if qs != "" {
+		t.Errorf("expected empty query string for empty slice, got %q", qs)
+	}
+}
+
+func TestBuildQueryString_EmbeddedStruct(t *testing.T) {
+	// Test that embedded struct fields (like core.ListOptions in order.ListOptions) work
+	opts := struct {
+		core.ListOptions
+		Status string `url:"status,omitempty"`
+	}{
+		ListOptions: core.ListOptions{Limit: 10, Page: 2},
+		Status:      "open",
+	}
+	qs := buildQueryString(&opts)
+	if !strings.Contains(qs, "limit=10") {
+		t.Errorf("expected 'limit=10' in %q", qs)
+	}
+	if !strings.Contains(qs, "page=2") {
+		t.Errorf("expected 'page=2' in %q", qs)
+	}
+	if !strings.Contains(qs, "status=open") {
+		t.Errorf("expected 'status=open' in %q", qs)
+	}
+}
+
+// ============== WithTimeout / WithCircuitBreaker option tests ==============
+
+func TestWithTimeout(t *testing.T) {
+	app := App{AppKey: "k", AppSecret: "s"}
+	client, err := NewClient(app, "shop", "tok", WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if client.httpClient.Timeout != 10*time.Second {
+		t.Errorf("expected 10s timeout, got %v", client.httpClient.Timeout)
+	}
+}
+
+func TestWithCircuitBreaker(t *testing.T) {
+	app := App{AppKey: "k", AppSecret: "s"}
+	client, err := NewClient(app, "shop", "tok",
+		WithCircuitBreaker(5, 30*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if client.cb == nil {
+		t.Fatal("expected non-nil circuit breaker")
+	}
+	if client.cb.State() != "closed" {
+		t.Errorf("expected initial state 'closed', got %q", client.cb.State())
+	}
+}

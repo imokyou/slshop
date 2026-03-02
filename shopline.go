@@ -58,6 +58,7 @@ type Client struct {
 	baseURLOverride string
 	maxRetries      int
 	log             Logger
+	cb              *CircuitBreaker // optional circuit breaker (nil = disabled)
 
 	// ========================
 	// Sub-package Services

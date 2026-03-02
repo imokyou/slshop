@@ -104,6 +104,13 @@ func (c *Client) Do(req *http.Request, result interface{}) (*http.Response, erro
 	}
 
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		// Check circuit breaker before each attempt
+		if c.cb != nil {
+			if cbErr := c.cb.Allow(); cbErr != nil {
+				return nil, cbErr
+			}
+		}
+
 		if attempt > 0 {
 			c.logDebugf("Retry attempt %d/%d for %s %s", attempt, c.maxRetries, req.Method, req.URL)
 			// Restore body for retry
@@ -114,6 +121,9 @@ func (c *Client) Do(req *http.Request, result interface{}) (*http.Response, erro
 
 		resp, err = c.httpClient.Do(req)
 		if err != nil {
+			if c.cb != nil {
+				c.cb.RecordFailure()
+			}
 			if attempt < c.maxRetries {
 				// P1-4: Exponential backoff with jitter for network errors
 				backoff := backoffDuration(attempt, time.Second)
@@ -129,6 +139,9 @@ func (c *Client) Do(req *http.Request, result interface{}) (*http.Response, erro
 
 		// Check for retryable status codes
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+			if c.cb != nil {
+				c.cb.RecordFailure()
+			}
 			if attempt < c.maxRetries {
 				// P1-5: Correctly parse Retry-After header
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -175,6 +188,11 @@ func (c *Client) Do(req *http.Request, result interface{}) (*http.Response, erro
 		if err := json.Unmarshal(body, result); err != nil {
 			return resp, fmt.Errorf("shopline: failed to decode response: %w (body: %s)", err, string(body))
 		}
+	}
+
+	// Notify circuit breaker of success
+	if c.cb != nil {
+		c.cb.RecordSuccess()
 	}
 
 	return resp, nil
@@ -285,7 +303,8 @@ func parseRetryAfter(header string) time.Duration {
 }
 
 // buildQueryString converts a struct with `url` tags to a query string.
-// This is a simplified version — supports basic types.
+// Supports basic scalar types and slice types ([]string, []int64, []int, etc.).
+// Slice fields are expanded into repeated query parameters: ids=1&ids=2&ids=3.
 func buildQueryString(opts interface{}) string {
 	if opts == nil {
 		return ""
@@ -304,11 +323,24 @@ func buildQueryString(opts interface{}) string {
 	}
 
 	params := url.Values{}
+	buildQueryStringFromStruct(v, params)
+	return params.Encode()
+}
+
+// buildQueryStringFromStruct recursively walks a struct (including embedded structs)
+// and populates params from fields tagged with `url`.
+func buildQueryStringFromStruct(v reflect.Value, params url.Values) {
 	t := v.Type()
 
 	for i := 0; i < v.NumField(); i++ {
 		field := v.Field(i)
 		fieldType := t.Field(i)
+
+		// Recurse into embedded (anonymous) structs to pick up their url tags
+		if fieldType.Anonymous && field.Kind() == reflect.Struct {
+			buildQueryStringFromStruct(field, params)
+			continue
+		}
 
 		tag := fieldType.Tag.Get("url")
 		if tag == "" || tag == "-" {
@@ -319,12 +351,21 @@ func buildQueryString(opts interface{}) string {
 		name := parts[0]
 		omitempty := len(parts) > 1 && parts[1] == "omitempty"
 
+		// Handle slice types: expand into repeated parameters
+		if field.Kind() == reflect.Slice {
+			if omitempty && field.Len() == 0 {
+				continue
+			}
+			for j := 0; j < field.Len(); j++ {
+				params.Add(name, fmt.Sprintf("%v", field.Index(j).Interface()))
+			}
+			continue
+		}
+
 		if omitempty && field.IsZero() {
 			continue
 		}
 
 		params.Set(name, fmt.Sprintf("%v", field.Interface()))
 	}
-
-	return params.Encode()
 }

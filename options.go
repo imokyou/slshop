@@ -1,6 +1,9 @@
 package shopline
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // Option configures a Client.
 type Option func(*Client)
@@ -63,5 +66,34 @@ func WithTokenManager(store TokenStore, opts ...TokenManagerOption) Option {
 		tm := NewTokenManager(c.app, c.handle, store, opts...)
 		tm.log = c.log // share logger
 		c.tokenManager = tm
+	}
+}
+
+// WithCircuitBreaker enables a circuit breaker that stops sending requests when
+// the upstream service is consistently failing.
+//
+// Parameters:
+//   - threshold: consecutive failures before the circuit opens (recommended: 5)
+//   - cooldown: how long to stay in Open state before probing again (recommended: 30s)
+//
+// When the circuit is Open, requests fail immediately with an error rather than
+// waiting for a timeout, protecting both the client and the upstream service.
+func WithCircuitBreaker(threshold int, cooldown time.Duration) Option {
+	return func(c *Client) {
+		c.cb = newCircuitBreaker(threshold, cooldown)
+	}
+}
+
+// WithTimeout overrides the HTTP client's request timeout.
+// The default timeout is 30 seconds.
+//
+// Use a longer timeout for bulk operations:
+//
+//	client, _ := shopline.NewClient(app, handle, token,
+//	    shopline.WithTimeout(5 * time.Minute), // for /bulk/ endpoints
+//	)
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		c.httpClient.Timeout = d
 	}
 }
